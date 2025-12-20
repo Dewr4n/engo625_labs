@@ -1,0 +1,368 @@
+clear;clc;
+
+epochs_num=1200; %20 minutes
+
+%read base station, 6 columns
+fid = fopen('/MATLAB Drive/BaseL1L2.obs');
+B = fread(fid,[6 Inf],'double')';
+
+%read rover station, 6 columns
+fid = fopen('/MATLAB Drive/RemoteL1L2.obs');
+R= fread(fid,[6 Inf],'double')';
+
+%read satellite, 8 columns
+fid = fopen('/MATLAB Drive/Satellites.sat');
+S = fread(fid,[8 Inf],'double')';
+
+%get observation time and prn
+%obs_time_S AND obs_time_B SAME
+%prns_S AND prns_B SAME
+obs_time_S=tabulate(S(:,2));
+obs_time_S(1,:)=[];
+obs_time_S(:,3)=[];
+
+obs_time_R=tabulate(R(:,2));
+obs_time_R(1,:)=[];
+obs_time_R(:,3)=[];
+
+obs_time_B=tabulate(B(:,2));
+obs_time_B(1,:)=[];
+obs_time_B(:,3)=[];
+
+prns_S=tabulate(S(:,1));
+prns_S(1,:)=[];
+prns_S(:,3)=[];
+
+prns_R=tabulate(R(:,1));
+prns_R(1,:)=[];
+prns_R(:,3)=[];
+
+prns_B=tabulate(B(:,1));
+prns_B(1,:)=[];
+prns_B(:,3)=[];
+
+XB=[-1625352.170843933,-3653483.751149267,4953733.869258050];
+XB_lla=[51.277,-113.983,1090.833];
+GTXR_lla=[51.258643,-114.100492,1127.345];
+GTXR=[-1633489.413087291,-3651627.194497138,4952481.599819198];
+wgs84 = wgs84Ellipsoid('meter');
+GTenu=zeros(1,3);
+[GTenu(1),GTenu(2),GTenu(3)]=ecef2enu(GTXR(1),GTXR(2),GTXR(3),XB_lla(1),XB_lla(2),XB_lla(3),wgs84);
+
+%ecef to enu
+phi = deg2rad(51.258643);
+lambda = deg2rad(-114.100492);
+% rotation matrix from ecef to enu
+	Rot = [-sin(lambda) cos(lambda) 0 ;
+         -cos(lambda)*sin(phi) -sin(lambda)*sin(phi) cos(phi);
+         cos(lambda)*cos(phi) cos(phi)*sin(lambda) sin(phi)];
+%1 dd results
+pose_errors=NaN(epochs_num,3);
+sds=NaN(epochs_num,3);
+els=NaN(epochs_num,size(prns_R,1));
+els_rover=NaN(epochs_num,size(prns_R,1));
+ratios=NaN(epochs_num,1);
+
+Ns=NaN(epochs_num,9);
+nstds=NaN(epochs_num,9);
+fixed_poses=NaN(epochs_num,9);
+%sequential ls  10 satellites, 9 ambiguities
+Cl=zeros(2*9,2*9);%%
+elevation=[27.2540;64.2150;31.3304;30.1165;37.2240;19.6152;14.3717;46.6379;11.2443];
+pivox_elevation=84;
+for k=1:9
+    Cl(k,k)=1*1;
+    % /sin(elevation(k,1)*pi/180)/sin(elevation(k,1)*pi/180)+1*1/sin(pivox_elevation*pi/180)/sin(pivox_elevation*pi/180)+ ...
+    % 1*1/sin(elevation(k,1)*pi/180)/sin(elevation(k,1)*pi/180)+1*1/sin(pivox_elevation*pi/180)/sin(pivox_elevation*pi/180);
+
+    Cl(9+k,9+k)=0.01*lambda*0.01*lambda;
+    % /sin(elevation(k,1)*pi/180)/sin(elevation(k,1)*pi/180)+0.01*lambda*0.01*lambda/sin(pivox_elevation*pi/180)/sin(pivox_elevation*pi/180) +...
+    % 0.01*lambda*0.01*lambda/sin(elevation(k,1)*pi/180)/sin(elevation(k,1)*pi/180)+0.01*lambda*0.01*lambda/sin(pivox_elevation*pi/180)/sin(pivox_elevation*pi/180);
+end
+
+Cx=eye((9+3),(9+3));%%
+
+Cx(1:3,1:3)=100*eye(3,3);
+Cx(4:12,4:12)=1e10*eye(9,9);
+Q=eye(12,12);
+Q(1:3,1:3)=0.0001*Q(1:3,1:3);
+
+Q(4:12,4:12)=1e-6*Q(4:12,4:12);
+xhat=zeros((9+3),1);%%
+
+flag=false;
+fixed=false;
+fixedN=zeros(9,1);
+ls=NaN(epochs_num,9);
+for i=1:epochs_num
+    %find rows of an epoch  size(k,1):number of satellites
+    k=find(S(:,2)==obs_time_S(i,1));
+
+    indices_BS=[];
+    indices_R=[];
+    for j=1:size(k,1)
+        p=S(k(j,1),1);
+        t=S(k(j,1),2);
+        for jj=1:43200
+            % do not use satellite  22(9) and 9(3) 18(7)
+            if R(jj,1)==p && R(jj,2)==t && R(jj,1)~=22 &&R(jj,1)~=9 &&R(jj,1)~=18 
+                indices_R(end+1) = jj;
+                indices_BS(end+1) = k(j,1);
+            end
+        end
+    end
+
+    %real number of satellites
+    num_of_satellites=size(indices_R,2);
+
+    %find max elevation angle
+    for j=1:num_of_satellites
+        prn=S(indices_BS(1,j),1);%prn of one obs
+        prn_idx=int32(find(prns_S(:,1)==prn));
+        %get elevation angle
+        satPos=[S(indices_BS(1,j),3) S(indices_BS(1,j),4) S(indices_BS(1,j),5)];
+
+        [~,els(i,prn_idx),~] = lookangles(XB_lla,satPos,0);
+    end
+    el=els(i,:);
+    el=el(~isnan(el));
+
+    [~,pivox_index]=max(el,[],2);
+    
+    el_new=zeros(1,num_of_satellites-1);
+    if pivox_index==num_of_satellites
+        el_new(1,1:num_of_satellites-1)=el(1,1:num_of_satellites-1);
+    else
+        el_new(1,1:pivox_index-1)=el(1,1:pivox_index-1);
+        el_new(1,pivox_index:end)=el(1,pivox_index+1:end);
+    end
+
+    %find rover station elevation angle
+    for j=1:num_of_satellites
+        prn=R(indices_R(1,j),1);%prn of one obs
+        prn_idx=int32(find(prns_R(:,1)==prn));
+        %get elevation angle
+        satPos=[S(indices_BS(1,j),3) S(indices_BS(1,j),4) S(indices_BS(1,j),5)];
+
+        [~,els_rover(i,prn_idx),~] = lookangles(GTXR_lla,satPos,0);
+    end
+    el_rover=els_rover(i,:);
+    el_rover=el_rover(~isnan(el_rover));
+    
+    el_rover_new=zeros(1,num_of_satellites-1);
+    if pivox_index==num_of_satellites
+        el_rover_new(1,1:num_of_satellites-1)=el_rover(1,1:num_of_satellites-1);
+    else
+        el_rover_new(1,1:pivox_index-1)=el_rover(1,1:pivox_index-1);
+        el_rover_new(1,pivox_index:end)=el_rover(1,pivox_index+1:end);
+    end
+
+    %double difference
+    XS=zeros(num_of_satellites,3);
+    pr_R=zeros(num_of_satellites,1);
+    pr_B=zeros(num_of_satellites,1);
+    ph_R=zeros(num_of_satellites,1);
+    ph_B=zeros(num_of_satellites,1);
+
+
+    CLIGHT      =299792458.0;         %speed of light (m/s)
+    MHZ_TO_HZ     =1000000.0;
+    FREQ_GPS_L1   =1575.42*MHZ_TO_HZ;
+    lambda=CLIGHT/FREQ_GPS_L1; %L1
+    % XR=[0;0;0];
+    % XR=[-1633459.580317199;-3651644.627857543;4952478.605502964];
+    for j=1:num_of_satellites
+        XS(j,1)=S(indices_BS(1,j),3);
+        XS(j,2)=S(indices_BS(1,j),4);
+        XS(j,3)=S(indices_BS(1,j),5);
+        pr_R(j,1)=R(indices_R(1,j),3);
+        pr_B(j,1)=B(indices_BS(1,j),3);
+        ph_R(j,1)=R(indices_R(1,j),4);
+        ph_B(j,1)=B(indices_BS(1,j),4);
+    end
+    
+    % if fix pose
+    % if 1
+    %     fixedN=[1;-12;-1;-10;-9;-20;-13;8;-2];
+    %     XR=[-1633459.580317199;-3651644.627857543;4952478.605502964];
+    %     [XR,cov_XR]=dd_code_phase_known_N(XR,XB,XS,pr_R,ph_R,pr_B,ph_B,pivox_index,lambda,fixedN);
+    % 
+    %     [e,n,u]=ecef2enu(XR(1),XR(2),XR(3),XB_lla(1),XB_lla(2),XB_lla(3),wgs84);
+    %     pose_errors(i,1)=e-GTenu(1);
+    %     pose_errors(i,2)=n-GTenu(2);
+    %     pose_errors(i,3)=u-GTenu(3);
+    %     cov=Rot*cov_XR*Rot';%ecef covariance to enu cov
+    %     sds(i,1)=sqrt(cov(1,1));
+    %     sds(i,2)=sqrt(cov(2,2));
+    %     sds(i,3)=sqrt(cov(3,3));
+    %     continue
+    % end
+
+    %the first epoch, use least square, and the results are initials 
+    % for second epoch(kalman filter)
+
+    if ~flag
+       XR=[0;0;0];
+       % XR=[-1633459.580317199;-3651644.627857543;4952478.605502964];
+       [XR,cov_XR,N,cov_N,residuals, Cx]=dd_code_phase(XR,XB,XS,pr_R,ph_R,pr_B,ph_B,pivox_index,lambda, ...
+       transpose(el_new),el(1,pivox_index),transpose(el_rover_new),el_rover(1,pivox_index));
+
+       xhat(1:3,1)=XR;
+       xhat(4:12,1)=N(:,1);
+       flag=true;
+       Cx=eye((9+3),(9+3));
+       Cx(1:3,1:3)=100*eye(3,3);
+       Cx(4:12,4:12)=1e10*eye(9,9);
+
+    elseif flag
+        % for plot innovation xhat(4:12,1)=[2;-12;-1;-10;-9;-20;-13;8;-2];
+        [A,l]=GetA(xhat(1:3,1), xhat(4:12,1), XB, XS,pr_R,ph_R,pr_B,ph_B,pivox_index,lambda);
+        ls(i,:)=l(10:end,:)';
+        Cx=Cx+Q;
+        K=Cx*transpose(A)*inv(A*Cx*transpose(A)+Cl);
+        xhat=xhat+K*l;
+        Cx=Cx-K*A*Cx;
+        Ns(i,:)=xhat(4:12,1)';
+    end
+
+    [firstmin, secondmin, firstN, secondN]=Brute_Force_Search(Cx(4:12,4:12), xhat(4:12,1));
+    ratios(i)=secondmin/firstmin;%>2
+    if i>1000 && ~fixed && ratios(i)>2
+         fixed=true;
+         fixedN=firstN;
+    end
+    % [NN,r]=mlambda(Cx(4:12,4:12),xhat(4:12,1),5);
+    % ratios(i)=r(2)/r(1);%>2
+    % if i>1000 && ~fixed && ratios(i)>2
+    %     fixed=true;
+    %     fixedN=NN(:,1);
+    % end
+    nstds(i,1)=sqrt(Cx(4,4));
+    nstds(i,2)=sqrt(Cx(5,5));
+    nstds(i,3)=sqrt(Cx(6,6));
+    nstds(i,4)=sqrt(Cx(7,7));
+    nstds(i,5)=sqrt(Cx(8,8));
+    nstds(i,6)=sqrt(Cx(9,9));
+    nstds(i,7)=sqrt(Cx(10,10));
+    nstds(i,8)=sqrt(Cx(11,11));
+    nstds(i,9)=sqrt(Cx(12,12));
+
+end
+%% 2 plot enu errors 
+% delta=2;
+% t=1:delta:epochs_num;
+% t=t';
+% subplot(2,2,1)
+% p=plot(t,pose_errors(1:delta:epochs_num,1),t,sds(1:delta:epochs_num,1),t,-sds(1:delta:epochs_num,1));
+% p(1).Color='red';
+% p(2).Color='blue';
+% p(3).Color='blue';
+% grid on
+% xlabel('Time t beginning from 239460(s)')
+% ylabel('east error(m)')
+% title('Fixed Double Difference East Errors')
+% legend('east error','std envelope')
+% 
+% subplot(2,2,2)
+% p=plot(t,pose_errors(1:delta:epochs_num,2),t,sds(1:delta:epochs_num,2),t,-sds(1:delta:epochs_num,2));
+% p(1).Color='red';
+% p(2).Color='blue';
+% p(3).Color='blue';
+% grid on
+% xlabel('Time t beginning from 239460(s)')
+% ylabel('north error(m)')
+% title('Fixed Double Difference North Errors')
+% legend('north error','std envelope')
+% 
+% subplot(2,2,3)
+% p=plot(t,pose_errors(1:delta:epochs_num,3),t,sds(1:delta:epochs_num,3),t,-sds(1:delta:epochs_num,3));
+% p(1).Color='red';
+% p(2).Color='blue';
+% p(3).Color='blue';
+% grid on
+% xlabel('Time t beginning from 239460(s)')
+% ylabel('up error(m)')
+% title('Fixed Double Difference Up Errors')
+% legend('up error','std envelope')
+
+%% 3 rmse
+% sum=0;
+% for i=1:epochs_num
+%     sum=sum+pose_errors(i,1)*pose_errors(i,1);
+% end
+% rmse_e=sqrt(sum/epochs_num);
+% 
+% sum=0;
+% for i=1:epochs_num
+%     sum=sum+pose_errors(i,2)*pose_errors(i,2);
+% end
+% rmse_n=sqrt(sum/epochs_num);
+% 
+% sum=0;
+% for i=1:epochs_num
+%     sum=sum+pose_errors(i,3)*pose_errors(i,3);
+% end
+% rmse_u=sqrt(sum/epochs_num);
+
+%% 4 plot ambiguities
+% a=[7;8;11;15;17;19;24;26;27;28];
+% fixedNNNNN=zeros(epochs_num,9);
+% for i=1:epochs_num
+%     fixedNNNNN(i,:)=fixedN';
+% end
+% for i=1
+% 
+%     %%subtract the first gps time
+%     starttime=S(1,2);
+%     endtime=S(1,2)+epochs_num-1;
+%     time=starttime:endtime;
+%     time=time';
+%     mintime=min(time);
+%     time=time-min(time)+1;
+% 
+%     %do not plot first epoch, really huge
+%     p=plot(time(2:epochs_num),Ns(2:end,i),time(2:epochs_num),Ns(2:end,i)-nstds(2:end,i),...
+%         time(2:epochs_num),Ns(2:end,i)+nstds(2:end,i), time(2:epochs_num), fixedNNNNN(2:end,i));
+%     p(1).Color='green';
+%     p(2).Color='blue';
+%     p(3).Color='yellow';
+%     p(4).Color='red';
+%     grid on ;
+% 
+%     xlabel(sprintf('Time beginning from: %.2f(s)',starttime));
+%     ylabel('Float Ambiguities(cycles)');
+% 
+%     lgd=legend('Float','-Std', 'Std', 'Fixed');
+% 
+%     lgd.FontSize = 14;
+%     title(sprintf('Ambiguities %.0f (pivox:28) ',a(i,1)),'FontSize',14,'Fontweight', 'bold');
+% end
+%% 5 plot ratios
+% delta=1;
+% t=1:delta:epochs_num;
+% t=t';
+% p=plot(t,ratios(1:delta:epochs_num,1));
+% p(1).Color='red';
+% 
+% grid on
+% xlabel('Time t beginning from 239460(s)')
+% ylabel('Ratio')
+% title('AR ratio(second smallest/smallest)')
+% legend('ratio')
+%% 6 plot innovation
+% delta=2;
+% t=2:delta:epochs_num;
+% plot(t,ls(2:delta:epochs_num,1),t,ls(2:delta:epochs_num,2),...
+%     t,ls(2:delta:epochs_num,3),t,ls(2:delta:epochs_num,4),...
+%     t,ls(2:delta:epochs_num,5),t,ls(2:delta:epochs_num,6),...
+%     t,ls(2:delta:epochs_num,7),t,ls(2:delta:epochs_num,8),...
+%     t,ls(2:delta:epochs_num,9));
+% 
+% grid on
+% xlabel('Time t beginning from 239460(s)')
+% ylabel('Innovation(m)')
+% title('Innovation of carrier phase(add one cycle to first amguity)')
+% legend('7','8',...
+%     '11','15','17',...
+%     '19',...
+%     '24','26','27')
